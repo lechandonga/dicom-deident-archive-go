@@ -1,0 +1,29 @@
+{
+  "salt": "change-me-to-a-random-site-secret",
+  "orgUID": "1.2.840.10008.99",
+  "dateShiftDays": 365,
+  "keepBirthDate": false,
+  "stripPrivate": true,
+  "rules": [
+    { "tag": "(0010,0010)", "action": "hash" },
+    { "tag": "(0010,0020)", "action": "hash" },
+    { "tag": "(0010,0021)", "action": "remove" },
+    { "tag": "(0010,0030)", "action": "shift-date" },
+    { "tag": "(0010,1000)", "action": "remove" },
+    { "tag": "(0010,1001)", "action": "remove" },
+    { "tag": "(0010,1005)", "action": "remove" },
+    { "tag": "(0008,0080)", "action": "remove" },
+    { "tag": "(0008,0090)", "action": "remove" },
+    { "tag": "(0008,0070)", "action": "remove" },
+    { "tag": "(0008,0020)", "action": "shift-date" },
+    { "tag": "(0008,0021)", "action": "shift-date" },
+    { "tag": "(0008,0022)", "action": "shift-date" },
+    { "tag": "(0008,0023)", "action": "shift-date" },
+    { "tag": "(0020,000D)", "action": "hash-uid" },
+    { "tag": "(0020,000E)", "action": "hash-uid" },
+    { "tag": "(0008,0018)", "action": "hash-uid" },
+    { "tag": "(0008,1030)", "action": "remove" },
+    { "tag": "(0008,1032)", "action": "remove" },
+    { "tag": "(0020,4000)", "action": "remove" }
+  ]
+}

@@ -65,8 +65,9 @@ func TestRejectsMissingMandatoryTag(t *testing.T) {
 }
 
 func TestRejectsUnsupportedTransferSyntax(t *testing.T) {
-	raw := dicomtest.Build(dicomtest.TSExplicitLE, sample)
-	raw = bytes.Replace(raw, []byte(dicomtest.TSExplicitLE), []byte("1.2.840.10008.1.9.9"), 1) // JPEG baseline
+	// Deflated Explicit VR LE: real compression this implementation cannot
+	// process locally (no inflate); must be rejected distinctly.
+	raw := dicomtest.Build("1.2.840.10008.1.2.1.99", sample)
 	_, err := dicom.Parse(bytes.NewReader(raw))
 	var ut *dicom.UnsupportedTransferError
 	if !errors.As(err, &ut) {

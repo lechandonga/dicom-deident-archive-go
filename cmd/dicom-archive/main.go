@@ -31,6 +31,8 @@ func main() {
 		err = cmdImport(os.Args[2:])
 	case "query":
 		err = cmdQuery(os.Args[2:])
+	case "export":
+		err = cmdExport(os.Args[2:])
 	case "gensample":
 		err = cmdGenSample(os.Args[2:])
 	default:
@@ -47,7 +49,16 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   dicom-archive import -archive DIR -salt SECRET <file-or-dir>...
   dicom-archive query  -archive DIR [-patient P] [-modality M] [-from YYYYMMDD] [-to YYYYMMDD] [-cursor C] [-limit N]
+  dicom-archive export -archive DIR -salt SECRET -out DIR [-patient P] [-modality M] [-from D] [-to D]
   dicom-archive gensample -out DIR [-n 10]`)
+}
+
+func addFilterFlags(flg *flag.FlagSet) (patient, modality, from, to *string) {
+	patient = flg.String("patient", "", "pseudonymised patient ID")
+	modality = flg.String("modality", "", "modality filter, e.g. CT")
+	from = flg.String("from", "", "study date from, YYYYMMDD")
+	to = flg.String("to", "", "study date to, YYYYMMDD")
+	return
 }
 
 func cmdImport(args []string) error {
@@ -73,7 +84,7 @@ func cmdImport(args []string) error {
 		}
 		if st.IsDir() {
 			filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-				if err == nil && !d.IsDir() {
+				if err == nil && !d.IsDir() && filepath.Base(p) != archive.ManifestName {
 					files = append(files, p)
 				}
 				return err
@@ -108,16 +119,14 @@ func cmdImport(args []string) error {
 func cmdQuery(args []string) error {
 	flg := flag.NewFlagSet("query", flag.ContinueOnError)
 	dir := flg.String("archive", "archive", "archive root directory")
-	patient := flg.String("patient", "", "pseudonymised patient ID")
-	modality := flg.String("modality", "", "modality filter, e.g. CT")
-	from := flg.String("from", "", "study date from, YYYYMMDD")
-	to := flg.String("to", "", "study date to, YYYYMMDD")
+	patient, modality, from, to := addFilterFlags(flg)
+	salt := flg.String("salt", "", "de-identification salt (optional for query)")
 	cursor := flg.String("cursor", "", "pagination cursor")
 	limit := flg.Int("limit", 50, "page size")
 	if err := flg.Parse(args); err != nil {
 		return err
 	}
-	store, err := archive.Open(*dir, deident.Mapper{})
+	store, err := archive.Open(*dir, deident.Mapper{Salt: *salt})
 	if err != nil {
 		return err
 	}
@@ -139,10 +148,46 @@ func cmdQuery(args []string) error {
 	return nil
 }
 
+func cmdExport(args []string) error {
+	flg := flag.NewFlagSet("export", flag.ContinueOnError)
+	dir := flg.String("archive", "archive", "archive root directory")
+	out := flg.String("out", "", "export target directory (required)")
+	salt := flg.String("salt", "", "de-identification salt (required)")
+	uidRoot := flg.String("uid-root", "2.25", "UID root used at import")
+	patient, modality, from, to := addFilterFlags(flg)
+	if err := flg.Parse(args); err != nil {
+		return err
+	}
+	if *salt == "" {
+		return errors.New("-salt is required")
+	}
+	if *out == "" {
+		return errors.New("-out is required")
+	}
+	store, err := archive.Open(*dir, deident.Mapper{Salt: *salt, UIDRoot: *uidRoot})
+	if err != nil {
+		return err
+	}
+	manifest, err := store.Export(*out, archive.Query{
+		PatientID: *patient, Modality: strings.ToUpper(*modality),
+		DateFrom: *from, DateTo: *to, Limit: 500,
+	})
+	if err != nil {
+		return err
+	}
+	for _, e := range manifest.Entries {
+		fmt.Printf("EXPORT  %s -> %s (sha256 %s)\n", e.SourcePath, e.ExportPath, e.ExportSHA256[:12])
+	}
+	fmt.Printf("summary: exported=%d manifest=%s\n", manifest.Count,
+		filepath.Join(*out, archive.ManifestName))
+	return nil
+}
+
 func cmdGenSample(args []string) error {
 	flg := flag.NewFlagSet("gensample", flag.ContinueOnError)
 	out := flg.String("out", "sample", "output directory")
 	n := flg.Int("n", 10, "number of instances")
+	variants := flg.Bool("variants", false, "also emit edge-case variants (encapsulated pixel, undefined/defined SQ, no meta group length)")
 	if err := flg.Parse(args); err != nil {
 		return err
 	}
@@ -164,6 +209,37 @@ func cmdGenSample(args []string) error {
 		}
 		p := dicomtest.WriteFile(*out, fmt.Sprintf("sample-%03d.dcm", i), syntaxes[i%3], f)
 		fmt.Println("wrote", p)
+	}
+	if *variants {
+		type v struct {
+			name string
+			ts   string
+			opt  dicomtest.Options
+			sop  string
+		}
+		f := dicomtest.Fields{
+			PatientID: "VAR-1", PatientName: "Variant^Case", BirthDate: "19901231",
+			Sex: "F", StudyUID: "9.9.1", StudyDate: "20240505", StudyID: "V",
+			SeriesUID: "9.9.2", SeriesNumber: "3", Modality: "CT",
+			SOPUID: "9.9.3", InstanceNo: "1",
+		}
+		pixel := make([]byte, 300*1024)
+		for i := range pixel {
+			pixel[i] = byte(i * 7)
+		}
+		cases := []v{
+			{"jpeg-lossless.dcm", dicomtest.TSJPEGLossless, dicomtest.Options{Pixel: pixel}, "9.9.3.1"},
+			{"rle.dcm", dicomtest.TSRLE, dicomtest.Options{Pixel: pixel}, "9.9.3.2"},
+			{"undef-sequence.dcm", dicomtest.TSExplicitLE, dicomtest.Options{UndefLengthSequence: true}, "9.9.3.3"},
+			{"defined-sequence.dcm", dicomtest.TSExplicitLE, dicomtest.Options{DefinedLengthSequence: true}, "9.9.3.4"},
+			{"no-meta-group-length.dcm", dicomtest.TSExplicitLE, dicomtest.Options{NoMetaGroupLength: true}, "9.9.3.5"},
+		}
+		for _, c := range cases {
+			fc := f
+			fc.SOPUID = c.sop
+			p := dicomtest.WriteFileOptions(*out, c.name, c.ts, fc, c.opt)
+			fmt.Println("wrote", p)
+		}
 	}
 	return nil
 }

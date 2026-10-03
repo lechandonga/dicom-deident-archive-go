@@ -10,7 +10,25 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
+)
+
+// Provenance tag values carried in exported datasets so an archive can tell
+// whether an incoming file is original data or a de-identified export, and
+// whether it was produced with the same salt.
+const (
+	// ProvenanceTagGroup/Element is a private LO tag (0011,0010) holding
+	// "DICOM-ARCHIVE-DEID-v1".
+	ProvenanceTagGroup   = 0x0011
+	ProvenanceTagElement = 0x0010
+	ProvenanceValue      = "DICOM-ARCHIVE-DEID-v1"
+
+	// TokenTagGroup/Element is a private UC tag (0011,0020) holding a
+	// salt-derived token: HMAC-like hash of a fixed label. Same salt
+	// reproduces the same token, proving provenance without revealing it.
+	TokenTagGroup   = 0x0011
+	TokenTagElement = 0x0020
 )
 
 // Mapper derives stable pseudonyms from original identifiers.
@@ -116,3 +134,57 @@ func (m Mapper) ShiftDate(origPatientID, da string) string {
 	}
 	return t.AddDate(0, 0, -m.DateShiftDays(origPatientID)).Format("20060102")
 }
+
+// ProvenanceToken returns the stable token proving a file was de-identified
+// with this mapper's salt. Compare incoming tokens with Token() to decide
+// between keeping pseudonyms (same salt) and re-mapping (different salt).
+func (m Mapper) ProvenanceToken() string {
+	sum := m.hash("provenance-token", ProvenanceValue)
+	return fmt.Sprintf("%032x", sum[:16])
+}
+
+// UID maps an arbitrary UID value, keeping one global mapping per input so
+// that the same source UID appearing in several elements/files always maps
+// identically, regardless of its role. Hierarchy UIDs (study/series/sop)
+// keep their dedicated kind spaces via StudyUID/SeriesUID/SOPUID.
+func (m Mapper) UID(orig string) string { return m.uid("uid-value", orig) }
+
+// IsValidDA reports whether s is a DICOM date value this mapper can shift.
+func IsValidDA(da string) bool {
+	if len(da) != 8 {
+		return false
+	}
+	_, err := time.Parse("20060102", da)
+	return err == nil
+}
+
+// ShiftDA shifts an already-valid DA value by the patient's fixed offset.
+func (m Mapper) ShiftDA(origPatientID, da string) string {
+	return m.ShiftDate(origPatientID, da)
+}
+
+// ShiftDays exposes the per-patient offset for callers that shift other date
+// representations (DT) consistently.
+func (m Mapper) ShiftDays(origPatientID string) int {
+	return m.DateShiftDays(origPatientID)
+}
+
+// ShiftDT shifts the date part of a DICOM DT (YYYYMMDDHHMMSS+ZZZZ), keeping
+// the time and offset components untouched.
+func (m Mapper) ShiftDT(origPatientID, dt string) string {
+	if len(dt) < 8 {
+		return dt
+	}
+	head := dt[:8]
+	if !IsValidDA(head) {
+		return dt
+	}
+	shifted := m.ShiftDate(origPatientID, head)
+	return shifted + dt[8:]
+}
+
+// UIDRootValue exposes the configured root.
+func (m Mapper) UIDRootValue() string { return m.uidRoot() }
+
+// _ keeps strings imported for future VM helpers.
+var _ = strings.TrimSpace

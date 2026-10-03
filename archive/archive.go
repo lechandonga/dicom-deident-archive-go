@@ -1,8 +1,9 @@
 // Package archive implements a local, concurrency-safe DICOM archive:
 // original files are copied verbatim into a patient/study/series directory
 // layout, while a de-identified JSON index supports filtered, stably
-// paginated queries. Import and query may run concurrently; readers never
-// observe partially imported instances.
+// paginated queries and reproducible de-identified dataset exports.
+// Import, query and export may run concurrently; readers never observe
+// partially imported instances and exports see one consistent snapshot.
 package archive
 
 import (
@@ -24,49 +25,49 @@ import (
 
 // Distinct import rejection reasons, classifiable with errors.Is.
 var (
-	// ErrConflict: same SOPInstanceUID already archived with different content.
 	ErrConflict = errors.New("archive: conflicting instance content for same SOPInstanceUID")
-	// ErrParse: file could not be parsed as DICOM (wraps dicom.Err* reasons).
-	ErrParse = errors.New("archive: file rejected during parsing")
+	ErrParse    = errors.New("archive: file rejected during parsing")
 )
 
 // Instance is one de-identified index record.
 type Instance struct {
-	PatientID    string `json:"patient_id"`   // pseudonymised
-	PatientName  string `json:"patient_name"` // pseudonymised
-	StudyUID     string `json:"study_uid"`    // pseudonymised
-	SeriesUID    string `json:"series_uid"`   // pseudonymised
-	SOPUID       string `json:"sop_uid"`      // pseudonymised
-	Modality     string `json:"modality"`
-	StudyDate    string `json:"study_date"` // shifted, YYYYMMDD
-	SeriesNumber string `json:"series_number"`
-	InstanceNo   string `json:"instance_number"`
-	SOPClassUID  string `json:"sop_class_uid"`
-	SHA256       string `json:"sha256"` // hash of original file bytes
-	Path         string `json:"path"`   // archive-relative path of the verbatim copy
+	PatientID         string `json:"patient_id"`
+	PatientName       string `json:"patient_name"`
+	StudyUID          string `json:"study_uid"`
+	SeriesUID         string `json:"series_uid"`
+	SOPUID            string `json:"sop_uid"`
+	Modality          string `json:"modality"`
+	StudyDate         string `json:"study_date"`
+	SeriesNumber      string `json:"series_number"`
+	InstanceNo        string `json:"instance_number"`
+	SOPClassUID       string `json:"sop_class_uid"`
+	TransferSyntaxUID string `json:"transfer_syntax_uid"`
+	SHA256            string `json:"sha256"`
+	Path              string `json:"path"`
+	ReImported        bool   `json:"reimported,omitempty"`
 }
 
 // ImportResult reports the outcome of importing one file.
 type ImportResult struct {
 	SourcePath string
-	Instance   *Instance // nil when Duplicate
-	Duplicate  bool      // true: identical content already archived (idempotent skip)
+	Instance   *Instance
+	Duplicate  bool
 }
 
 // Query filters instances; zero fields match everything.
 type Query struct {
-	PatientID string // pseudonymised PatientID prefix/exact match
+	PatientID string
 	Modality  string
-	DateFrom  string // YYYYMMDD inclusive
-	DateTo    string // YYYYMMDD inclusive
-	Cursor    string // opaque token from a previous Page
-	Limit     int    // default 50, max 500
+	DateFrom  string
+	DateTo    string
+	Cursor    string
+	Limit     int
 }
 
 // Page is one stable page of results.
 type Page struct {
 	Instances  []Instance
-	NextCursor string // empty when no more results
+	NextCursor string
 }
 
 type indexFile struct {
@@ -78,8 +79,8 @@ type Store struct {
 	dir    string
 	mapper deident.Mapper
 	mu     sync.RWMutex
-	byUID  map[string]*Instance // pseudonymised SOP UID -> record
-	all    []*Instance          // stable sort order maintained on insert
+	byUID  map[string]*Instance
+	all    []*Instance
 }
 
 // Open loads (or creates) an archive rooted at dir.
@@ -110,15 +111,13 @@ func Open(dir string, mapper deident.Mapper) (*Store, error) {
 
 func (s *Store) indexPath() string { return filepath.Join(s.dir, "index.json") }
 
-// Import parses, de-identifies and archives one DICOM file.
-//
-//   - Parse failures return an error wrapping ErrParse and the specific
-//     dicom.Err* reason; nothing is stored.
-//   - Same SOP UID + identical content hash: idempotent no-op (Duplicate).
-//   - Same SOP UID + different content: rejected with ErrConflict.
-//
-// The index commit is atomic: concurrent queries see either the full record
-// or nothing, never a partial import.
+// Mapper exposes the archive's mapper (used by the exporter).
+func (s *Store) Mapper() deident.Mapper { return s.mapper }
+
+// Dir exposes the archive root (exporter resolves data paths read-only).
+func (s *Store) Dir() string { return s.dir }
+
+// Import parses, validates (whole-file), de-identifies and archives one file.
 func (s *Store) Import(srcPath string) (*ImportResult, error) {
 	f, err := os.Open(srcPath)
 	if err != nil {
@@ -127,32 +126,16 @@ func (s *Store) Import(srcPath string) (*ImportResult, error) {
 	defer f.Close()
 
 	h := sha256.New()
-	meta, err := dicom.Parse(io.TeeReader(f, h))
+	meta, err := dicom.ParseVerify(io.TeeReader(f, h))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrParse, srcPath, err)
 	}
-	if _, err := io.Copy(h, f); err != nil { // hash the remainder verbatim
+	if _, err := io.Copy(h, f); err != nil {
 		return nil, err
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
 
-	inst := &Instance{
-		PatientID:    s.mapper.PatientID(meta.PatientID),
-		PatientName:  s.mapper.PatientName(meta.PatientName),
-		StudyUID:     s.mapper.StudyUID(meta.StudyInstanceUID),
-		SeriesUID:    s.mapper.SeriesUID(meta.SeriesInstanceUID),
-		SOPUID:       s.mapper.SOPUID(meta.SOPInstanceUID),
-		Modality:     meta.Modality,
-		StudyDate:    s.mapper.ShiftDate(meta.PatientID, meta.StudyDate),
-		SeriesNumber: meta.SeriesNumber,
-		InstanceNo:   meta.InstanceNumber,
-		SOPClassUID:  meta.SOPClassUID,
-		SHA256:       sum,
-		Path: filepath.Join("data", s.mapper.PatientID(meta.PatientID),
-			s.mapper.StudyUID(meta.StudyInstanceUID),
-			s.mapper.SeriesUID(meta.SeriesInstanceUID),
-			s.mapper.SOPUID(meta.SOPInstanceUID)+".dcm"),
-	}
+	inst := s.buildInstance(meta, sum)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -164,7 +147,6 @@ func (s *Store) Import(srcPath string) (*ImportResult, error) {
 			ErrConflict, srcPath, meta.SOPInstanceUID, existing.SHA256[:12], sum[:12])
 	}
 
-	// Copy the original bytes verbatim; never modified.
 	dst := filepath.Join(s.dir, inst.Path)
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return nil, err
@@ -184,7 +166,44 @@ func (s *Store) Import(srcPath string) (*ImportResult, error) {
 	return &ImportResult{SourcePath: srcPath, Instance: inst}, nil
 }
 
-// persistLocked rewrites the index atomically (tmp file + rename).
+// buildInstance computes the index record based on provenance markers.
+func (s *Store) buildInstance(meta *dicom.Meta, sum string) *Instance {
+	provenance, token := extractProvenance(meta)
+	sameKey := provenance && token == s.mapper.ProvenanceToken()
+
+	pid, name := meta.PatientID, meta.PatientName
+	study, series, sop := meta.StudyInstanceUID, meta.SeriesInstanceUID, meta.SOPInstanceUID
+	date := meta.StudyDate
+
+	if !(provenance && sameKey) {
+		pid = s.mapper.PatientID(meta.PatientID)
+		name = s.mapper.PatientName(meta.PatientName)
+		study = s.mapper.StudyUID(meta.StudyInstanceUID)
+		series = s.mapper.SeriesUID(meta.SeriesInstanceUID)
+		sop = s.mapper.SOPUID(meta.SOPInstanceUID)
+		date = s.mapper.ShiftDate(meta.PatientID, meta.StudyDate)
+	}
+
+	inst := &Instance{
+		PatientID:         pid,
+		PatientName:       name,
+		StudyUID:          study,
+		SeriesUID:         series,
+		SOPUID:            sop,
+		Modality:          meta.Modality,
+		StudyDate:         date,
+		SeriesNumber:      meta.SeriesNumber,
+		InstanceNo:        meta.InstanceNumber,
+		SOPClassUID:       meta.SOPClassUID,
+		TransferSyntaxUID: meta.TransferSyntaxUID,
+		SHA256:            sum,
+		ReImported:        provenance && sameKey,
+	}
+	inst.Path = filepath.Join("data", inst.PatientID, inst.StudyUID, inst.SeriesUID, inst.SOPUID+".dcm")
+	return inst
+}
+
+// persistLocked rewrites the index atomically.
 func (s *Store) persistLocked() error {
 	f := indexFile{Instances: make([]Instance, 0, len(s.all))}
 	for _, inst := range s.all {
@@ -201,10 +220,7 @@ func (s *Store) persistLocked() error {
 	return os.Rename(tmp, s.indexPath())
 }
 
-// Query returns a stable page of matching instances. Results are ordered by
-// (StudyDate, StudyUID, SeriesNumber, InstanceNumber, SOPUID); the cursor is
-// the index offset, safe because imports only append new unique SOP UIDs and
-// the offset cursor pins position in the sorted snapshot taken per call.
+// Query returns a stable page of matching instances.
 func (s *Store) Query(q Query) (Page, error) {
 	if q.Limit <= 0 {
 		q.Limit = 50
@@ -243,6 +259,17 @@ func (s *Store) Query(q Query) (Page, error) {
 	return page, nil
 }
 
+// snapshotLocked returns a value-copy of all matching instances.
+func (s *Store) snapshotLocked(q Query) []Instance {
+	out := []Instance{}
+	for _, inst := range s.all {
+		if matches(inst, q) {
+			out = append(out, *inst)
+		}
+	}
+	return out
+}
+
 func matches(inst *Instance, q Query) bool {
 	if q.PatientID != "" && inst.PatientID != q.PatientID {
 		return false
@@ -259,7 +286,6 @@ func matches(inst *Instance, q Query) bool {
 	return true
 }
 
-// less defines the global stable sort order.
 func less(a, b *Instance) bool {
 	if a.StudyDate != b.StudyDate {
 		return a.StudyDate < b.StudyDate
@@ -302,7 +328,8 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	buf := make([]byte, 256*1024)
+	if _, err := io.CopyBuffer(out, in, buf); err != nil {
 		out.Close()
 		return err
 	}

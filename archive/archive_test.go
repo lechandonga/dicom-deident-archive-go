@@ -50,7 +50,8 @@ func TestRejectsCorruptTruncatedMissingTag(t *testing.T) {
 		want error
 	}{
 		{"not-dicom", make([]byte, 512), dicom.ErrNotDICOM},
-		{"truncated", good[:200], dicom.ErrTruncated},
+		{"truncated-meta", good[:200], dicom.ErrTruncated},
+		{"truncated-pixel", good[:len(good)-2], dicom.ErrTruncated},
 		{"unsupported-ts", replaceTS(good), dicom.ErrUnsupportedTransfer},
 	}
 	for _, c := range cases {
@@ -82,11 +83,8 @@ func TestRejectsCorruptTruncatedMissingTag(t *testing.T) {
 }
 
 func replaceTS(b []byte) []byte {
-	out := make([]byte, len(b))
-	copy(out, b)
-	i := indexOf(out, []byte(dicomtest.TSExplicitLE))
-	copy(out[i:], []byte("1.2.840.10008.1.9.9"))
-	return out
+	return dicomtest.Build("1.2.840.10008.1.2.1.99",
+		fields("P1", "1.1.1", "1.1.2", "1.1.9", "20240101", "CT", "1"))
 }
 
 func indexOf(b, sub []byte) int {

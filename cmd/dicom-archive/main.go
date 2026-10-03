@@ -1,8 +1,10 @@
-// Command dicom-archive is a local DICOM de-identification and archive CLI.
+// Command dicom-archive is a local DICOM de-identification, archive and
+// export/rebuilder CLI.
 //
-//	dicom-archive import -archive DIR -salt SECRET <file-or-dir>...
-//	dicom-archive query  -archive DIR [-patient P] [-modality CT] [-from D] [-to D] [-cursor C] [-limit N]
-//	dicom-archive gensample -out DIR [-n 10]
+//	dicom-archive import    -archive DIR -salt SECRET <file-or-dir>...
+//	dicom-archive query     -archive DIR [-patient P] [-modality CT] [-from D] [-to D] [-cursor C] [-limit N]
+//	dicom-archive export    -archive DIR -salt SECRET -out DIR [-patient P] [-modality M] [-from D] [-to D]
+//	dicom-archive gensample -out DIR [-n 10] [-quirks]
 package main
 
 import (
@@ -31,6 +33,8 @@ func main() {
 		err = cmdImport(os.Args[2:])
 	case "query":
 		err = cmdQuery(os.Args[2:])
+	case "export":
+		err = cmdExport(os.Args[2:])
 	case "gensample":
 		err = cmdGenSample(os.Args[2:])
 	default:
@@ -45,9 +49,25 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  dicom-archive import -archive DIR -salt SECRET <file-or-dir>...
-  dicom-archive query  -archive DIR [-patient P] [-modality M] [-from YYYYMMDD] [-to YYYYMMDD] [-cursor C] [-limit N]
-  dicom-archive gensample -out DIR [-n 10]`)
+  dicom-archive import    -archive DIR -salt SECRET <file-or-dir>...
+  dicom-archive query     -archive DIR [-patient P] [-modality M] [-from YYYYMMDD] [-to YYYYMMDD] [-cursor C] [-limit N]
+  dicom-archive export    -archive DIR -salt SECRET -out DIR [-patient P] [-modality M] [-from YYYYMMDD] [-to YYYYMMDD]
+  dicom-archive gensample -out DIR [-n 10] [-quirks]`)
+}
+
+func addFilterFlags(flg *flag.FlagSet) (patient, modality, from, to *string) {
+	patient = flg.String("patient", "", "pseudonymised patient ID")
+	modality = flg.String("modality", "", "modality filter, e.g. CT")
+	from = flg.String("from", "", "study date from, YYYYMMDD")
+	to = flg.String("to", "", "study date to, YYYYMMDD")
+	return
+}
+
+func queryFromFlags(patient, modality, from, to string) archive.Query {
+	return archive.Query{
+		PatientID: patient, Modality: strings.ToUpper(modality),
+		DateFrom: from, DateTo: to,
+	}
 }
 
 func cmdImport(args []string) error {
@@ -65,22 +85,9 @@ func cmdImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	var files []string
-	for _, root := range flg.Args() {
-		st, err := os.Stat(root)
-		if err != nil {
-			return err
-		}
-		if st.IsDir() {
-			filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-				if err == nil && !d.IsDir() {
-					files = append(files, p)
-				}
-				return err
-			})
-		} else {
-			files = append(files, root)
-		}
+	files, err := collectFiles(flg.Args())
+	if err != nil {
+		return err
 	}
 	var imported, dup, rejected int
 	for _, f := range files {
@@ -105,13 +112,34 @@ func cmdImport(args []string) error {
 	return nil
 }
 
+func collectFiles(args []string) ([]string, error) {
+	var files []string
+	for _, root := range args {
+		st, err := os.Stat(root)
+		if err != nil {
+			return nil, err
+		}
+		if st.IsDir() {
+			err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+				if err == nil && !d.IsDir() {
+					files = append(files, p)
+				}
+				return err
+			})
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			files = append(files, root)
+		}
+	}
+	return files, nil
+}
+
 func cmdQuery(args []string) error {
 	flg := flag.NewFlagSet("query", flag.ContinueOnError)
 	dir := flg.String("archive", "archive", "archive root directory")
-	patient := flg.String("patient", "", "pseudonymised patient ID")
-	modality := flg.String("modality", "", "modality filter, e.g. CT")
-	from := flg.String("from", "", "study date from, YYYYMMDD")
-	to := flg.String("to", "", "study date to, YYYYMMDD")
+	patient, modality, from, to := addFilterFlags(flg)
 	cursor := flg.String("cursor", "", "pagination cursor")
 	limit := flg.Int("limit", 50, "page size")
 	if err := flg.Parse(args); err != nil {
@@ -121,10 +149,9 @@ func cmdQuery(args []string) error {
 	if err != nil {
 		return err
 	}
-	page, err := store.Query(archive.Query{
-		PatientID: *patient, Modality: strings.ToUpper(*modality),
-		DateFrom: *from, DateTo: *to, Cursor: *cursor, Limit: *limit,
-	})
+	q := queryFromFlags(*patient, *modality, *from, *to)
+	q.Cursor, q.Limit = *cursor, *limit
+	page, err := store.Query(q)
 	if err != nil {
 		return err
 	}
@@ -139,14 +166,50 @@ func cmdQuery(args []string) error {
 	return nil
 }
 
+func cmdExport(args []string) error {
+	flg := flag.NewFlagSet("export", flag.ContinueOnError)
+	dir := flg.String("archive", "archive", "archive root directory")
+	salt := flg.String("salt", "", "same salt used when importing (required)")
+	uidRoot := flg.String("uid-root", "2.25", "UID root used when importing")
+	out := flg.String("out", "export", "export target directory")
+	patient, modality, from, to := addFilterFlags(flg)
+	if err := flg.Parse(args); err != nil {
+		return err
+	}
+	if *salt == "" {
+		return errors.New("-salt is required")
+	}
+	store, err := archive.Open(*dir, deident.Mapper{Salt: *salt, UIDRoot: *uidRoot})
+	if err != nil {
+		return err
+	}
+	man, err := store.Export(queryFromFlags(*patient, *modality, *from, *to), *out)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("exported %d instance(s) to %s\n", len(man.Entries), *out)
+	fmt.Printf("manifest: %s (fingerprint %s)\n",
+		filepath.Join(*out, "manifest.json"), man.Fingerprint)
+	for _, e := range man.Entries {
+		fmt.Printf("OK  %s  patient=%s  %s  sha256=%s\n",
+			e.RelativePath, e.PatientID, e.SOPUID, e.FileSHA256[:16])
+	}
+	return nil
+}
+
 func cmdGenSample(args []string) error {
 	flg := flag.NewFlagSet("gensample", flag.ContinueOnError)
 	out := flg.String("out", "sample", "output directory")
 	n := flg.Int("n", 10, "number of instances")
+	quirks := flg.Bool("quirks", false,
+		"also emit encapsulated-pixel, undefined-length-SQ and no-meta-length variants")
 	if err := flg.Parse(args); err != nil {
 		return err
 	}
 	syntaxes := []string{dicomtest.TSImplicitLE, dicomtest.TSExplicitLE, dicomtest.TSExplicitBE}
+	if *quirks {
+		syntaxes = append(syntaxes, dicomtest.TSJPEGLossless, dicomtest.TSRLE)
+	}
 	for i := 0; i < *n; i++ {
 		f := dicomtest.Fields{
 			PatientID:    fmt.Sprintf("PAT-%03d", i%3),
@@ -162,8 +225,23 @@ func cmdGenSample(args []string) error {
 			SOPUID:       fmt.Sprintf("1.2.826.0.1.3680043.9.7.%d.3", i),
 			InstanceNo:   "1",
 		}
-		p := dicomtest.WriteFile(*out, fmt.Sprintf("sample-%03d.dcm", i), syntaxes[i%3], f)
-		fmt.Println("wrote", p)
+		ts := syntaxes[i%len(syntaxes)]
+		var opt dicomtest.Options
+		if *quirks {
+			opt.EncapsulatedPixel = ts == dicomtest.TSJPEGLossless || ts == dicomtest.TSRLE
+			opt.UndefinedSQ = i%2 == 1
+			opt.NoMetaGroupLength = i%3 == 2
+		}
+		raw := dicomtest.BuildWithOptions(ts, f, opt)
+		name := fmt.Sprintf("sample-%03d.dcm", i)
+		p := filepath.Join(*out, name)
+		if err := os.MkdirAll(*out, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(p, raw, 0o644); err != nil {
+			return err
+		}
+		fmt.Println("wrote", p, ts)
 	}
 	return nil
 }

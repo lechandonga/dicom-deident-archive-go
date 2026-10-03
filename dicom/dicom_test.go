@@ -64,13 +64,21 @@ func TestRejectsMissingMandatoryTag(t *testing.T) {
 	t.Logf("missing tag detected: %v", err)
 }
 
-func TestRejectsUnsupportedTransferSyntax(t *testing.T) {
-	raw := dicomtest.Build(dicomtest.TSExplicitLE, sample)
-	raw = bytes.Replace(raw, []byte(dicomtest.TSExplicitLE), []byte("1.2.840.10008.1.9.9"), 1) // JPEG baseline
-	_, err := dicom.Parse(bytes.NewReader(raw))
-	var ut *dicom.UnsupportedTransferError
-	if !errors.As(err, &ut) {
-		t.Fatalf("want UnsupportedTransferError, got %v", err)
+func TestAcceptsCompressedTransferSyntax(t *testing.T) {
+	raw := dicomtest.BuildWithOptions(dicomtest.TSJPEGBaseline, sample,
+		dicomtest.Options{EncapsulatedPixel: true})
+	m, err := dicom.Parse(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("encapsulated transfer must be accepted: %v", err)
 	}
-	t.Logf("unsupported transfer syntax: %v", err)
+	t.Logf("encapsulated transfer accepted: %s", m.TransferSyntaxUID)
+
+	for _, ts := range []string{dicomtest.TSImplicitLE, dicomtest.TSExplicitLE,
+		dicomtest.TSExplicitBE, dicomtest.TSJPEGLossless, dicomtest.TSRLE} {
+		raw := dicomtest.BuildWithOptions(ts, sample,
+			dicomtest.Options{EncapsulatedPixel: ts != dicomtest.TSImplicitLE && ts != dicomtest.TSExplicitBE})
+		if _, err := dicom.Parse(bytes.NewReader(raw)); err != nil {
+			t.Fatalf("ts %s: %v", ts, err)
+		}
+	}
 }

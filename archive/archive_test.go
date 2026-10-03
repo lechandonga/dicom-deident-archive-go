@@ -51,7 +51,6 @@ func TestRejectsCorruptTruncatedMissingTag(t *testing.T) {
 	}{
 		{"not-dicom", make([]byte, 512), dicom.ErrNotDICOM},
 		{"truncated", good[:200], dicom.ErrTruncated},
-		{"unsupported-ts", replaceTS(good), dicom.ErrUnsupportedTransfer},
 	}
 	for _, c := range cases {
 		p := filepath.Join(dir, c.name+".dcm")
@@ -79,30 +78,6 @@ func TestRejectsCorruptTruncatedMissingTag(t *testing.T) {
 	if len(page.Instances) != 0 {
 		t.Fatalf("rejected files must not be archived, got %d", len(page.Instances))
 	}
-}
-
-func replaceTS(b []byte) []byte {
-	out := make([]byte, len(b))
-	copy(out, b)
-	i := indexOf(out, []byte(dicomtest.TSExplicitLE))
-	copy(out[i:], []byte("1.2.840.10008.1.9.9"))
-	return out
-}
-
-func indexOf(b, sub []byte) int {
-	for i := 0; i+len(sub) <= len(b); i++ {
-		ok := true
-		for j := range sub {
-			if b[i+j] != sub[j] {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return i
-		}
-	}
-	return -1
 }
 
 func TestCrossFileConsistencyAndIdempotency(t *testing.T) {

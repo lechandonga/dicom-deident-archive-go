@@ -10,8 +10,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 )
+
+// MethodVersion identifies the de-identification method embedded in every
+// exported file. Bump when mapping rules change incompatibly.
+const MethodVersion = "GSB-DEIDENT-1"
 
 // Mapper derives stable pseudonyms from original identifiers.
 type Mapper struct {
@@ -63,6 +68,35 @@ func (m Mapper) PatientID(orig string) string {
 func (m Mapper) PatientName(orig string) string {
 	sum := m.hash("patient-name", orig)
 	return fmt.Sprintf("ANON^%016x", binary.BigEndian.Uint64(sum[:8]))
+}
+
+// OtherName pseudonymises any non-patient PN value (e.g. referring
+// physician or operator) deterministically, so human names never survive
+// export while repeated occurrences stay consistent.
+func (m Mapper) OtherName(orig string) string {
+	sum := m.hash("other-name", orig)
+	return fmt.Sprintf("PERSON^%016x", binary.BigEndian.Uint64(sum[:8]))
+}
+
+// GenericUID maps any UID that is not one of the four hierarchy levels.
+// The kind discriminator keeps equal UID strings in different roles from
+// collapsing; callers may instead reuse level mappers when the role is
+// known.
+func (m Mapper) GenericUID(kind, orig string) string { return m.uid(kind, orig) }
+
+// Fingerprint is a non-reversible digest of the local key. Exported files
+// carry it so re-import with the SAME key can recognise already final
+// pseudonyms and never apply a second shift; a different key safely derives
+// a fresh, internally consistent identity set instead.
+func (m Mapper) Fingerprint() string {
+	sum := m.hash("fingerprint")
+	return fmt.Sprintf("%x", sum[:16])
+}
+
+// NormalizeUID strips trailing padding/spaces the way DICOM encoders
+// sometimes append, so UID comparisons against map keys are exact.
+func NormalizeUID(s string) string {
+	return strings.TrimRight(s, "\x00 ")
 }
 
 // uid converts an original UID into a syntactically valid DICOM UID under

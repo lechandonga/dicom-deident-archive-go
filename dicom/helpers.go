@@ -12,6 +12,11 @@ type frame struct {
 	kind byte // 'i' = inside item body, 'q' = inside sequence (between items)
 }
 
+// errLimitExhausted marks a declared-length boundary reached exactly (all
+// declared bytes consumed). A stream ending mid-read instead yields
+// ErrTruncated, so callers can tell a complete region from a cut-short one.
+var errLimitExhausted = fmt.Errorf("dicom: declared length exhausted")
+
 // delimReader presents the contents of one undefined-length item as a raw
 // byte stream, stopping at the item's own Item Delimiter (consumed). It
 // parses structure to track nesting depth; element values flow through in

@@ -141,8 +141,20 @@ func (s *Store) exportOne(srcRoot, stage string, inst Instance, mapper deident.M
 		return ManifestEntry{}, fmt.Errorf("%w: %s: %v", ErrParse, src, err)
 	}
 
-	secrets := residualSecrets(meta)
-	umap := newUIDMapper(mapper, meta)
+	provenance, token := extractProvenance(meta)
+	sameKey := provenance && token == mapper.ProvenanceToken()
+	// A same-salt rebuilt archive already stores the final pseudonyms and
+	// shifted dates. Re-exporting it must be an identity pass: no second
+	// UID mapping, no second date shift, and the current (pseudonymous)
+	// values are not "residual identity".
+	var secrets []string
+	shiftDate := func(da string) string { return mapper.ShiftDate(meta.PatientID, da) }
+	if sameKey {
+		shiftDate = func(da string) string { return da }
+	} else {
+		secrets = residualSecrets(meta)
+	}
+	umap := newUIDMapper(mapper, meta, sameKey)
 
 	rel := exportRel(inst)
 	stagePath := filepath.Join(stage, filepath.FromSlash(rel))
@@ -160,7 +172,7 @@ func (s *Store) exportOne(srcRoot, stage string, inst Instance, mapper deident.M
 		MapUID:         umap.mapUID,
 		MapPatientID:   func(string) string { return inst.PatientID },
 		MapPatientName: func(string) string { return inst.PatientName },
-		ShiftDate:      func(da string) string { return mapper.ShiftDate(meta.PatientID, da) },
+		ShiftDate:      shiftDate,
 		Markers: []dicom.Marker{
 			{Tag: dicom.Tag{Group: deident.ProvenanceTagGroup, Element: deident.ProvenanceTagElement}, VR: "LO", Value: deident.ProvenanceValue},
 			{Tag: dicom.Tag{Group: deident.TokenTagGroup, Element: deident.TokenTagElement}, VR: "UC", Value: mapper.ProvenanceToken()},

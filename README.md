@@ -112,6 +112,13 @@ DICOM Tag，绝不静默放过。
 - **同一盐回灌**：令牌匹配 → 直接采用文件中的伪标识与移位日期，**不再映射、
   不再移位**；索引记录标记 `reimported=true`。新库按原条件查询，命中实例集合
   与原库一致，可直接拿导出清单逐项核对。
+- **同一盐、重建库再导出**：重建库再次 `export` 是一次恒等透传——UID（患者、
+  研究、序列、实例、媒体存储 SOP、序列内引用 UID 等全部 UID 元素）不再二次
+  映射，日期不再二次移位，脱敏标记（provenance/token/`PatientIdentityRemoved`）
+  原样保留而不重复插入，因此重建库导出的每份 `.dcm` 与原库交付文件**逐字节
+  相同**，`export_sha256` 与患者/研究/序列/实例标识、各级 UID、日期都能和原
+  导出清单逐项对上；`source_sha256` 是各归档内源文件的哈希，不同归档不同，属
+  预期。重建库重复导出到同一目录仍然幂等、可复现。
 - **换盐回灌**：令牌不匹配 → 把文件里的标识当作输入值，用新盐整体再映射成
   另一套一致的假名（同一患者/研究/序列/实例仍然各自一致、日期同患者同偏移），
   正常入库，不报错。
@@ -142,10 +149,28 @@ DICOM Tag，绝不静默放过。
 | 导出残留原始标识 | `archive.ErrResidualIdentity`（文件+Tag） |
 | 导出目标同名异内容 | `archive.ErrExportConflict`（路径+双方哈希） |
 
-整份文件完整性校验覆盖到 EOF：导入使用全文件验证（`ParseVerify`），截断或
-损坏发生在文件信息组、数据集、嵌套序列、像素片段或文件尾部任何位置都会被拒绝；
-同文件重复导入为幂等 `DUP`，不产生副本。导入与导出都使用 256 KiB 流式缓冲，
-单文件几百 MB 也不会整份读入内存。
+整份文件完整性校验覆盖到 EOF：导入使用全文件验证（`ParseVerify`），以下位置
+的截断或损坏都会以可区分的原因拒绝（CLI 打印 `REJECT <文件>` 与具体原因，
+归档 API 错误用 `errors.Is/As` 分类并携带源文件路径）：
+
+- **文件信息组**：preamble/DICM、meta 元素头、VR、长度字段、声明组长度未填满；
+- **数据集**：任意元素 tag/VR/长度头读到一半、声明值长度超出剩余字节、
+  简单元素长度为奇数（像素数据除外）；
+- **嵌套序列**：未定义长度序列缺 Sequence Delimiter、未定义 Item 缺 Item
+  Delimiter、定长序列/Item 声明区域被底层 EOF 提前截断、定长 Item 内部
+  出现 Item/Sequence Delimiter（结构损坏）；
+- **像素载荷**（原生）：声明长度只截掉尾部 1~2 字节、载荷中部截断、只剩
+  长度声明而整个载荷缺失一律拒绝；声明长度为奇时，流中必须且只能多跟
+  1 个 pad 字节，缺 pad 或再多字节都拒绝；
+- **像素载荷**（封装：JPEG/JPEG-LS/JPEG2000/RLE）：任意数据片段内部截断、
+  片段头/体边界截断、奇数片段长度、缺 Sequence Delimiter 一律拒绝；
+- **文件尾部**：像素数据后出现非 `(FFFC,FFFC)` 元素（结构错误）、
+  `(FFFC,FFFC)` Data Set Trailing Padding 之后仍有多余字节、尾部杂散字节
+  无法构成完整元素头，都拒绝；`(FFFC,FFFC)` 填充本身被正确接受。
+
+同文件重复导入为幂等 `DUP`，不产生副本；同 SOP UID 但内容不同仍以
+`ErrConflict` 拒绝。导入与导出都使用 256 KiB 流式缓冲，单文件几百 MB
+也不会整份读入内存。
 
 ## 本地造样本、复现与验证
 
@@ -158,6 +183,24 @@ DICOM Tag，绝不静默放过。
 - `defined-sequence.dcm`：定长序列写法；
 - `no-meta-group-length.dcm`：无 `(0002,0000)` 长度声明。
 
+所有 `gensample` 产物（常规轮转样本与全部边缘变体）均按严格 DICOM P10
+规范生成，本仓库的 `dicom.ParseVerify` 全文件校验必须全部通过：
+
+- 文件信息组按 Tag 升序排列，含 File Meta Information Version `(0002,0001)`、
+  Media Storage SOP Class/Instance UID、Transfer Syntax UID、Implementation
+  Class UID/Version Name；组长度字段位置与数值正确；
+- 显式 VR 未压缩像素使用 `OW` 长 VR 头（`VR + 2 保留字节 + 32 位长度`），
+  不会再出现短头导致严格校验器把载荷前 4 字节误读为声明长度的“长度越界”；
+- 数据集带完整常用 IOD 必填元素（Image Type、Study/Series/Instance 标识、
+  Manufacturer、像素模块 `(0028,*)`：SamplesPerPixel、PhotometricInterpretation
+  MONOCHROME2、Rows/Columns、PixelSpacing、BitsAllocated/Stored、HighBit、
+  PixelRepresentation）；封装样本的像素片段长度恒为偶数、BOT + 数据片段 +
+  Sequence Delimiter 完整。
+
+能收的写法与传输语法（与下文“接收/拒绝”清单一致）：隐式/显式 LE、显式 BE、
+全部显式 VR LE 封装语法（JPEG 基线/扩展/无损、JPEG-LS、JPEG 2000、RLE）、
+未定义/定长序列、无 meta 组长度；像素始终不解码、不改写。
+
 手动验证建议：
 
 ```bash
@@ -168,17 +211,42 @@ diff -r d1 d2 && echo "byte-identical"
 
 # 幂等：再导一次不应改动/新增文件
 find d2 -newer d2/export-manifest.json   # 无输出
+
+# 隔离环境重建 + 重建库再导出（同密钥）：.dcm 必须逐字节一致，
+# manifest 除 source_sha256（各归档内源文件哈希）外完全一致
+./dicom-archive import -archive rebuilt -salt k d1
+./dicom-archive export -archive rebuilt -salt k -out d3
+for f in $(cd d1 && find . -name '*.dcm'); do cmp d1/$f d3/$f || echo "DIFF $f"; done
+diff <(grep -v source_sha256 d1/export-manifest.json) \
+     <(grep -v source_sha256 d3/export-manifest.json) && echo stable
+
+# 完整性：像素尾部 / 载荷内部 / 只留长度声明，全部必须 REJECT
+cp sample/sample-000.dcm cut-tail.dcm  && truncate -s -2 cut-tail.dcm
+cp sample/jpeg-lossless.dcm cut-frag.dcm && truncate -s -100 cut-frag.dcm
+./dicom-archive import -archive check -salt k cut-tail.dcm cut-frag.dcm
+# -> 两个 REJECT，原因分别落在 ErrTruncated（payload bytes missing /
+#    pixel fragment / Sequence Delimiter），日志含完整文件路径
 ```
 
 ## 测试覆盖
 
 - `dicom`：三种未压缩语法、JPEG 无损/RLE 封装、未定义/定长序列、无组长度、
-  各区域截断（preamble/meta/数据集/序列/像素片段/尾部）、结构损坏、
-  不支持的 deflated 语法；重写器对 80 MiB 封装像素逐字节保留、残留自查；
+  各区域截断（preamble/meta/数据集/序列/原生像素载荷内部与“只剩长度声明”、
+  封装片段内部与定界符、文件尾部）、奇数长度元素/片段、像素 pad 字节规则、
+  `(FFFC,FFFC)` 数据集填充接受与杂散尾部拒绝、定长 Item 内错位定界符、
+  结构损坏、不支持的 deflated 语法；重写器对 80 MiB 封装像素逐字节保留、
+  残留自查、标记去重（重建库不二次插入）；
 - `deident`：映射确定性与无碰撞、日期顺序/间隔保持、重跑不漂移、UID 合法性、
   盐令牌稳定；
 - `archive`：损坏按可区分原因拒绝、跨文件标识与日期一致性、重复导入幂等、
   冲突拒绝、组合过滤与稳定分页；导出脱敏与索引一致、压缩像素不变、
   清单核对、重复导出幂等、同名异内容冲突、失败无暂存残留、200 MiB 流式
   导入导出、同密钥回灌不二次偏移且查询集合一致、换密钥得到另一套一致假名、
-  导入+查询+导出并发（`-race -count=3` 下通过）。
+  **同密钥重建库再导出逐字节一致、清单逐项对得上、二次导出幂等**、
+  回灌交付集里像素截断文件被拒；导入+查询+导出并发（`-race -count=3`
+  下通过）。
+- `cmd/dicom-archive`：`gensample -variants` 的全部样本与导出目录中每份影像
+  都通过严格 `ParseVerify`，封装像素跨两跳逐字节保留，重建库再导出全部有效。
+
+所有新增/相关用例的日志都打印“输入（传输语法/截断字节数/文件名）→ 结论
+（accepted / rejected 及具体原因）”，`go test -v` 可直接核对。

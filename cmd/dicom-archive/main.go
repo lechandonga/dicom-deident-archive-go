@@ -211,33 +211,9 @@ func cmdGenSample(args []string) error {
 		fmt.Println("wrote", p)
 	}
 	if *variants {
-		type v struct {
-			name string
-			ts   string
-			opt  dicomtest.Options
-			sop  string
-		}
-		f := dicomtest.Fields{
-			PatientID: "VAR-1", PatientName: "Variant^Case", BirthDate: "19901231",
-			Sex: "F", StudyUID: "9.9.1", StudyDate: "20240505", StudyID: "V",
-			SeriesUID: "9.9.2", SeriesNumber: "3", Modality: "CT",
-			SOPUID: "9.9.3", InstanceNo: "1",
-		}
-		pixel := make([]byte, 300*1024)
-		for i := range pixel {
-			pixel[i] = byte(i * 7)
-		}
-		cases := []v{
-			{"jpeg-lossless.dcm", dicomtest.TSJPEGLossless, dicomtest.Options{Pixel: pixel}, "9.9.3.1"},
-			{"rle.dcm", dicomtest.TSRLE, dicomtest.Options{Pixel: pixel}, "9.9.3.2"},
-			{"undef-sequence.dcm", dicomtest.TSExplicitLE, dicomtest.Options{UndefLengthSequence: true}, "9.9.3.3"},
-			{"defined-sequence.dcm", dicomtest.TSExplicitLE, dicomtest.Options{DefinedLengthSequence: true}, "9.9.3.4"},
-			{"no-meta-group-length.dcm", dicomtest.TSExplicitLE, dicomtest.Options{NoMetaGroupLength: true}, "9.9.3.5"},
-		}
-		for _, c := range cases {
-			fc := f
-			fc.SOPUID = c.sop
-			p := dicomtest.WriteFileOptions(*out, c.name, c.ts, fc, c.opt)
+		for _, c := range dicomtest.VariantSpecs(dicomtest.DeterministicPixel()) {
+			f := dicomtest.VariantFields(c.SOP)
+			p := dicomtest.WriteFileOptions(*out, c.Name, c.TS, f, c.Opt)
 			fmt.Println("wrote", p)
 		}
 	}

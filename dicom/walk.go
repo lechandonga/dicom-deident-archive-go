@@ -23,10 +23,26 @@ func (l limitEndReader) Read(p []byte) (int, error) {
 	}
 	n, err := l.lr.Read(p)
 	if err == io.EOF {
-		// Exhausted exactly at the boundary (or mid-read truncation).
-		return n, errLimitEnd
+		if l.lr.N <= 0 {
+			// Boundary reached exactly; report both boundary and clean EOF
+			// so callers waiting for a declared limit end terminate, while
+			// a following zero-byte read signals a normal stream end.
+			return n, boundaryEnd{}
+		}
+		// Underlying stream ended before the declared length was consumed.
+		return n, fmt.Errorf("%w: %d more byte(s) expected", ErrTruncated, l.lr.N)
 	}
 	return n, err
+}
+
+// boundaryEnd answers errors.Is for both errLimitEnd (declared-length
+// loops stop here) and io.EOF (a stream that ends exactly on a boundary is
+// complete, not truncated).
+type boundaryEnd struct{}
+
+func (boundaryEnd) Error() string { return "dicom: declared length boundary reached" }
+func (boundaryEnd) Is(target error) bool {
+	return target == errLimitEnd || target == io.EOF
 }
 
 // Parse reads a DICOM P10 stream and extracts metadata. Only header-region
@@ -47,16 +63,19 @@ func ParseVerify(r io.Reader) (*Meta, error) {
 	if err != nil {
 		return nil, err
 	}
-	var one [1]byte
-	n, err := io.ReadFull(sr, one[:])
-	if err != io.EOF && err != io.ErrUnexpectedEOF {
-		return nil, fmt.Errorf("%w: trailing bytes after last element", ErrCorrupt)
+	rest, err := io.ReadAll(io.LimitReader(sr, 2))
+	if err != nil {
+		return nil, err
 	}
-	if n > 1 {
+	// At most one byte may trail: the pad byte after an odd-length
+	// non-pixel element at the very end of the dataset.
+	if len(rest) > 1 {
 		return nil, fmt.Errorf("%w: trailing bytes after last element", ErrCorrupt)
 	}
 	return m, nil
 }
+
+var tagDatasetPadding = Tag{0xFFFC, 0xFFFC}
 
 func parse(r io.Reader, verify bool) (*Meta, *streamReader, error) {
 	header, err := readFull(r, 132, "preamble")
@@ -167,6 +186,9 @@ func readMetaGroup(r *streamReader, syn syntax) ([]MetaElement, error) {
 	for {
 		h, err := readHeader(in, syn, "file meta element")
 		if err != nil {
+			if errors.Is(err, errCleanEOF) && declared >= 0 {
+				return nil, fmt.Errorf("%w: file meta group shorter than declared length", ErrTruncated)
+			}
 			if errors.Is(err, errLimitEnd) {
 				return out, nil
 			}
@@ -183,6 +205,9 @@ func readMetaGroup(r *streamReader, syn syntax) ([]MetaElement, error) {
 		if err != nil {
 			return nil, err
 		}
+		if h.length%2 != 0 && h.tag != TagPixelData {
+			return nil, fmt.Errorf("%w: odd length %d for file meta element %s", ErrCorrupt, h.length, h.tag)
+		}
 		out = append(out, MetaElement{Tag: h.tag, VR: h.vr, Value: val})
 	}
 }
@@ -193,6 +218,9 @@ func readValue(r io.Reader, h elementHeader) ([]byte, error) {
 		return nil, fmt.Errorf("%w: undefined length for non-sequence %s", ErrCorrupt, h.tag)
 	}
 	buf, err := readFull(r, int(h.length), "value of "+h.tag.String())
+	if errors.Is(err, errCleanEOF) {
+		return nil, fmt.Errorf("%w: value of %s", ErrTruncated, h.tag)
+	}
 	if errors.Is(err, errLimitEnd) {
 		return nil, fmt.Errorf("%w: value of %s crosses declared length", ErrTruncated, h.tag)
 	}
@@ -207,7 +235,7 @@ func walkInto(r io.Reader, syn syntax, verify bool, vals map[Tag]string) error {
 	for {
 		h, err := readHeader(r, syn, "element")
 		if err != nil {
-			if err == io.EOF || errors.Is(err, errLimitEnd) {
+			if err == io.EOF || errors.Is(err, errLimitEnd) || errors.Is(err, errCleanEOF) {
 				return nil
 			}
 			return err
@@ -220,7 +248,31 @@ func walkInto(r io.Reader, syn syntax, verify bool, vals map[Tag]string) error {
 			if err := drainPixelData(r, syn, h, verify); err != nil {
 				return err
 			}
-			return nil
+			if !verify {
+				return nil
+			}
+			// Pixel data must be the last dataset element apart from
+			// (FFFC,FFFC) Data Set Trailing Padding. Drain any padding
+			// elements structurally; anything else or a truncated tail is
+			// rejected below.
+			for {
+				ph, perr := readHeader(r, syn, "element after pixel data")
+				if perr == io.EOF || errors.Is(perr, errCleanEOF) || errors.Is(perr, errLimitEnd) {
+					return nil
+				}
+				if perr != nil {
+					return perr
+				}
+				if ph.tag != tagDatasetPadding {
+					return fmt.Errorf("%w: element %s after Pixel Data", ErrCorrupt, ph.tag)
+				}
+				if ph.undefined {
+					return fmt.Errorf("%w: undefined length for Data Set Trailing Padding", ErrCorrupt)
+				}
+				if err := copyN(io.Discard, r, int64(ph.length)); err != nil {
+					return err
+				}
+			}
 		}
 		pb := &streamReader{r: r}
 		isSeq, err := isSequence(pb, syn, h)
@@ -236,6 +288,9 @@ func walkInto(r io.Reader, syn syntax, verify bool, vals map[Tag]string) error {
 		val, err := readValue(pb, h)
 		if err != nil {
 			return err
+		}
+		if verify && h.length%2 != 0 {
+			return fmt.Errorf("%w: odd length %d for element %s", ErrCorrupt, h.length, h.tag)
 		}
 		if _, ok := vals[h.tag]; !ok {
 			vals[h.tag] = cleanValue(val)
@@ -280,7 +335,7 @@ func drainSequence(r io.Reader, syn syntax, h elementHeader, verify bool, vals m
 		for {
 			ih, err := readHeader(r, syn, "sequence item")
 			if err != nil {
-				if err == io.EOF {
+				if err == io.EOF || errors.Is(err, errCleanEOF) {
 					return fmt.Errorf("%w: sequence %s missing Sequence Delimiter", ErrTruncated, h.tag)
 				}
 				return err
@@ -323,7 +378,7 @@ func drainItem(r io.Reader, syn syntax, ih elementHeader, verify bool, vals map[
 		if errors.Is(err, errItemDelimHit) {
 			return nil
 		}
-		if err == nil {
+		if err == nil || errors.Is(err, errCleanEOF) || err == io.EOF {
 			return fmt.Errorf("%w: item missing Item Delimiter", ErrTruncated)
 		}
 		return err
@@ -332,7 +387,12 @@ func drainItem(r io.Reader, syn syntax, ih elementHeader, verify bool, vals map[
 		return fmt.Errorf("%w: odd item length %d", ErrCorrupt, ih.length)
 	}
 	lr := limitEndReader{&io.LimitedReader{R: r, N: int64(ih.length)}}
-	if err := walkInto(lr, syn, verify, vals); err != nil && !errors.Is(err, errItemDelimHit) {
+	err := walkInto(lr, syn, verify, vals)
+	if errors.Is(err, errItemDelimHit) {
+		// Delimiters are only legal inside undefined-length items.
+		return fmt.Errorf("%w: unexpected Item/Sequence Delimiter inside defined-length item", ErrCorrupt)
+	}
+	if err != nil {
 		return err
 	}
 	return nil
@@ -343,15 +403,18 @@ func drainItem(r io.Reader, syn syntax, ih elementHeader, verify bool, vals map[
 func drainPixelData(r io.Reader, syn syntax, h elementHeader, verify bool) error {
 	if !h.undefined {
 		if !verify {
-			// Can't "skip" without reading from a plain Reader; the parse
-			// entry point stops immediately after metadata anyway, so this
-			// only runs inside verify=true flows.
 			return nil
 		}
-		if _, err := io.CopyN(io.Discard, r, int64(h.length)); err != nil && err != io.EOF {
-			return fmt.Errorf("%w: pixel data: %v", ErrTruncated, err)
+		if err := copyN(io.Discard, r, int64(h.length)); err != nil {
+			return err
 		}
-		// Optional single trailing pad byte is left for the caller to check.
+		if h.length%2 != 0 {
+			// Pixel Data may carry exactly one trailing pad byte.
+			var pad [1]byte
+			if _, err := io.ReadFull(r, pad[:]); err != nil {
+				return fmt.Errorf("%w: pixel data missing trailing pad byte", ErrTruncated)
+			}
+		}
 		return nil
 	}
 	// Encapsulated: optional BOT fragment, data fragments, Sequence Delim.
@@ -361,7 +424,7 @@ func drainPixelData(r io.Reader, syn syntax, h elementHeader, verify bool) error
 	for {
 		ih, err := readHeader(r, syn, "pixel fragment")
 		if err != nil {
-			if err == io.EOF {
+			if err == io.EOF || errors.Is(err, errCleanEOF) {
 				return fmt.Errorf("%w: pixel data missing Sequence Delimiter", ErrTruncated)
 			}
 			return err
@@ -373,13 +436,29 @@ func drainPixelData(r io.Reader, syn syntax, h elementHeader, verify bool) error
 			if ih.undefined {
 				return fmt.Errorf("%w: undefined-length pixel fragment", ErrCorrupt)
 			}
-			if _, err := io.CopyN(io.Discard, r, int64(ih.length)); err != nil && err != io.EOF {
-				return fmt.Errorf("%w: pixel fragment: %v", ErrTruncated, err)
+			if ih.length%2 != 0 {
+				return fmt.Errorf("%w: odd pixel fragment length %d", ErrCorrupt, ih.length)
+			}
+			if err := copyN(io.Discard, r, int64(ih.length)); err != nil {
+				return err
 			}
 		default:
 			return fmt.Errorf("%w: expected pixel fragment Item, got %s", ErrCorrupt, ih.tag)
 		}
 	}
+}
+
+// copyN drains exactly n bytes; a short read (including io.EOF before the
+// count is met) is truncation, never silently accepted.
+func copyN(w io.Writer, r io.Reader, n int64) error {
+	written, err := io.CopyN(w, r, n)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return fmt.Errorf("%w: %d of %d payload bytes missing", ErrTruncated, n-written, n)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrTruncated, err)
+	}
+	return nil
 }
 
 func cleanValue(b []byte) string {

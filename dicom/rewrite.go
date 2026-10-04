@@ -102,12 +102,15 @@ func Rewrite(r io.Reader, w io.Writer, spec RewriteSpec) (*RewriteResult, error)
 		return nil, err
 	}
 
-	rw := &rewriter{spec: spec, findings: []AuditFinding{}}
+	rw := &rewriter{spec: spec, findings: []AuditFinding{}, seenMark: map[Tag]bool{}}
 	if err := rw.rewriteDataset(sr, syn, w); err != nil {
 		return nil, err
 	}
-	var one [1]byte
-	if _, err := io.ReadFull(sr, one[:]); err != io.EOF && err != io.ErrUnexpectedEOF {
+	rest, err := io.ReadAll(io.LimitReader(sr, 2))
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) > 1 {
 		return nil, fmt.Errorf("%w: trailing bytes after last element", ErrCorrupt)
 	}
 	return &RewriteResult{AuditFindings: rw.findings}, nil
@@ -117,15 +120,30 @@ type rewriter struct {
 	spec     RewriteSpec
 	findings []AuditFinding
 	markers  bool
+	seenMark map[Tag]bool
 }
 
 func (rw *rewriter) writeMarkers(w io.Writer, syn syntax) error {
 	for _, mk := range rw.spec.Markers {
+		if rw.seenMark[mk.Tag] {
+			continue
+		}
 		if err := writeSimpleElement(w, syn, mk.Tag, mk.VR, padString(mk.VR, mk.Value)); err != nil {
 			return err
 		}
+		rw.seenMark[mk.Tag] = true
 	}
 	return nil
+}
+
+// markerFor reports whether t is one of the configured provenance markers.
+func (rw *rewriter) markerFor(t Tag) (Marker, bool) {
+	for _, mk := range rw.spec.Markers {
+		if mk.Tag == t {
+			return mk, true
+		}
+	}
+	return Marker{}, false
 }
 
 // rewriteDataset streams dataset elements: identity simple elements are
@@ -145,13 +163,16 @@ func (rw *rewriter) rewriteDataset(r *streamReader, syn syntax, w io.Writer) err
 			}
 			return err
 		}
-		if h.tag == TagPixelData {
-			if !rw.markers {
-				if err := rw.writeMarkers(w, syn); err != nil {
-					return err
-				}
-				rw.markers = true
+		if h.tag == TagPixelData && !rw.markers {
+			if err := rw.writeMarkers(w, syn); err != nil {
+				return err
 			}
+			rw.markers = true
+		}
+		if rw.markers || h.tag == TagPixelData {
+			// Pixel data and everything after it is copied byte-for-byte.
+			// Provenance markers, already present when re-exporting a
+			// rebuilt archive, ride along verbatim instead of duplicating.
 			return copyPixelAndTrailer(r, syn, h, w)
 		}
 		isSeq, err := isSequence(r, syn, h)
@@ -167,6 +188,16 @@ func (rw *rewriter) rewriteDataset(r *streamReader, syn syntax, w io.Writer) err
 		val, err := readValue(r, h)
 		if err != nil {
 			return err
+		}
+		if _, isMarker := rw.markerFor(h.tag); isMarker {
+			if _, err := w.Write(h.hdr); err != nil {
+				return err
+			}
+			if _, err := w.Write(val); err != nil {
+				return err
+			}
+			rw.seenMark[h.tag] = true
+			continue
 		}
 		if outVal, vr, handled := rw.transformSimple(syn, h, val); handled {
 			if err := writeSimpleElement(w, syn, h.tag, vr, outVal); err != nil {
@@ -254,7 +285,7 @@ func (rw *rewriter) rewriteSequence(r io.Reader, syn syntax, h elementHeader, w 
 	}
 	emitItem := func(item io.Reader) error {
 		var body bytes.Buffer
-		sub := &rewriter{spec: rw.spec, findings: rw.findings}
+		sub := &rewriter{spec: rw.spec, findings: rw.findings, seenMark: rw.seenMark}
 		if err := sub.rewriteDataset(&streamReader{r: item}, syn, &body); err != nil {
 			return fmt.Errorf("item body: %w", err)
 		}
@@ -330,8 +361,21 @@ func copyPixelAndTrailer(r io.Reader, syn syntax, h elementHeader, w io.Writer) 
 // copyPixelVerbatim validates and copies pixel data unchanged.
 func copyPixelVerbatim(r io.Reader, syn syntax, h elementHeader, w io.Writer) error {
 	if !h.undefined {
-		if _, err := io.CopyN(w, r, int64(h.length)); err != nil && err != io.EOF {
+		n, err := io.CopyN(w, r, int64(h.length))
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return fmt.Errorf("%w: %d of %d pixel bytes missing", ErrTruncated, int64(h.length)-n, h.length)
+		}
+		if err != nil {
 			return fmt.Errorf("%w: pixel data: %v", ErrTruncated, err)
+		}
+		if h.length%2 != 0 {
+			var pad [1]byte
+			if _, err := io.ReadFull(r, pad[:]); err != nil {
+				return fmt.Errorf("%w: pixel data missing trailing pad byte", ErrTruncated)
+			}
+			if _, err := w.Write(pad[:]); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -353,7 +397,14 @@ func copyPixelVerbatim(r io.Reader, syn syntax, h elementHeader, w io.Writer) er
 			if ih.undefined {
 				return fmt.Errorf("%w: undefined-length pixel fragment", ErrCorrupt)
 			}
-			if _, err := io.CopyN(w, r, int64(ih.length)); err != nil && err != io.EOF {
+			if ih.length%2 != 0 {
+				return fmt.Errorf("%w: odd pixel fragment length %d", ErrCorrupt, ih.length)
+			}
+			n, err := io.CopyN(w, r, int64(ih.length))
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return fmt.Errorf("%w: %d of %d pixel fragment bytes missing", ErrTruncated, int64(ih.length)-n, ih.length)
+			}
+			if err != nil {
 				return fmt.Errorf("%w: pixel fragment: %v", ErrTruncated, err)
 			}
 		default:

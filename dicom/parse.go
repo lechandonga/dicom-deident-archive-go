@@ -148,6 +148,19 @@ type syntax struct {
 	order    binary.ByteOrder
 }
 
+// cleanEOF marks a boundary reached with a zero-byte read; it answers both
+// == io.EOF (structural loops treat it as a normal end) and errors.Is(err,
+// errCleanEOF) (verification paths distinguish it from mid-element
+// truncation, which carries ErrTruncated).
+type cleanEOF struct{}
+
+func (cleanEOF) Error() string { return io.EOF.Error() }
+func (cleanEOF) Is(target error) bool {
+	return target == io.EOF
+}
+
+var errCleanEOF = cleanEOF{}
+
 // streamReader is an io.Reader with a prepend buffer, enough to push back a
 // parsed element header (max 12 bytes) while structuring the read.
 type streamReader struct {
@@ -179,13 +192,26 @@ func readFull(r io.Reader, n int, what string) ([]byte, error) {
 		m, err := r.Read(buf[got:])
 		got += m
 		if err != nil {
+			var be boundaryEnd
+			if errors.As(err, &be) {
+				if got == n {
+					return buf, nil
+				}
+				if got == 0 {
+					return nil, err
+				}
+				return nil, fmt.Errorf("%w: %s", ErrTruncated, what)
+			}
 			if errors.Is(err, errLimitEnd) {
-				return nil, errLimitEnd
+				return nil, err
 			}
 			if errors.Is(err, errItemEnd) {
 				return nil, errItemEnd
 			}
-			if err == io.EOF {
+			if err == io.EOF && got == 0 {
+				return nil, cleanEOF{}
+			}
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return nil, fmt.Errorf("%w: %s", ErrTruncated, what)
 			}
 			return nil, err
@@ -215,6 +241,9 @@ func readHeader(r io.Reader, syn syntax, what string) (elementHeader, error) {
 	if h.tag.Group == 0xFFFE {
 		lb, err := readFull(r, 4, "length of "+h.tag.String())
 		if err != nil {
+			if errors.Is(err, errCleanEOF) {
+				return h, fmt.Errorf("%w: length of %s", ErrTruncated, h.tag)
+			}
 			return h, err
 		}
 		hdr = append(hdr, lb...)
@@ -227,6 +256,9 @@ func readHeader(r io.Reader, syn syntax, what string) (elementHeader, error) {
 	if syn.explicit {
 		vrb, err := readFull(r, 2, "VR of "+h.tag.String())
 		if err != nil {
+			if errors.Is(err, errCleanEOF) {
+				return h, fmt.Errorf("%w: VR of %s", ErrTruncated, h.tag)
+			}
 			return h, err
 		}
 		h.vr = string(vrb)
@@ -237,6 +269,9 @@ func readHeader(r io.Reader, syn syntax, what string) (elementHeader, error) {
 		if longVRs[h.vr] {
 			lb, err := readFull(r, 6, "length of "+h.tag.String())
 			if err != nil {
+				if errors.Is(err, errCleanEOF) {
+					return h, fmt.Errorf("%w: length of %s", ErrTruncated, h.tag)
+				}
 				return h, err
 			}
 			hdr = append(hdr, lb...)
@@ -244,6 +279,9 @@ func readHeader(r io.Reader, syn syntax, what string) (elementHeader, error) {
 		} else {
 			lb, err := readFull(r, 2, "length of "+h.tag.String())
 			if err != nil {
+				if errors.Is(err, errCleanEOF) {
+					return h, fmt.Errorf("%w: length of %s", ErrTruncated, h.tag)
+				}
 				return h, err
 			}
 			hdr = append(hdr, lb...)
@@ -252,6 +290,9 @@ func readHeader(r io.Reader, syn syntax, what string) (elementHeader, error) {
 	} else {
 		lb, err := readFull(r, 4, "length of "+h.tag.String())
 		if err != nil {
+			if errors.Is(err, errCleanEOF) {
+				return h, fmt.Errorf("%w: length of %s", ErrTruncated, h.tag)
+			}
 			return h, err
 		}
 		hdr = append(hdr, lb...)
